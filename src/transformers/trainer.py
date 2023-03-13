@@ -207,6 +207,8 @@ if is_accelerate_available():
 if TYPE_CHECKING:
     import optuna
 
+import time
+
 logger = logging.get_logger(__name__)
 
 
@@ -3032,6 +3034,8 @@ class Trainer:
         """
         args = self.args
 
+        print("--------------------- Running into evaluation_loop -----------------")
+
         prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
 
         # if eval is called w/o train init deepspeed here
@@ -3092,6 +3096,63 @@ class Trainer:
 
         observed_num_examples = 0
         # Main evaluation loop
+        total_time = 0
+        total_data = 0
+
+        if self.args.ipex:
+            # Import Extension
+            import intel_extension_for_pytorch as ipex
+            print("[INFO|benchmark log] Running with IPEX...")
+            if self.args.precision == 'bfloat16':
+                # Automatically mix precision
+                model = ipex.optimize(model, dtype=torch.bfloat16) #ipex.enable_auto_mixed_precision(mixed_dtype=torch.bfloat16)
+                print("[INFO|benchmark log] Running with bfloat16...")
+        if self.args.precision == 'int8':
+            # create inputs for quantization
+            jit_inputs=()
+            example_input = None
+            for _,batch in enumerate(dataloader):
+                example_input = batch
+                for _,label in enumerate(batch):
+                    print(label)
+                    if label == 'pixel_values':
+                        dumpy_tensor = torch.ones((batch[label].shape), dtype=torch.long)
+                        #if  dumpy_tensor.shape!=torch.Size([1]):
+                        L1=list(jit_inputs)
+                        L1.append(dumpy_tensor)
+                        jit_inputs=tuple(L1)
+                break
+            # example_input['head_mask'] = None
+            import intel_extension_for_pytorch as ipex
+            from intel_extension_for_pytorch.quantization import prepare, convert
+            from torch.ao.quantization import MinMaxObserver, PerChannelMinMaxObserver, QConfig
+            qconfig = QConfig(activation=MinMaxObserver.with_args(qscheme=torch.per_tensor_affine, dtype=torch.quint8), weight=PerChannelMinMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_channel_symmetric))
+            ipex.nn.utils._model_convert.replace_dropout_with_identity(model)
+            print(len(jit_inputs))
+            print(jit_inputs[0].shape)
+            # print(jit_inputs[1].shape)
+            prepared_model = prepare(model, qconfig, example_inputs=jit_inputs, inplace=False)
+            # prepared_model.load_qconf_summary(qconf_summary = "") # self.args.int8_config == ""
+            del example_input['labels']
+            print(example_input)
+            for i in range(10):    
+                prepared_model(**example_input)
+            # convert model to trace model.
+            if False: # self.args.mix_bf16 == False
+                with torch.cpu.amp.autocast():
+                    model = convert(prepared_model)
+                    model = torch.jit.trace(model, jit_inputs, strict=False)
+            else:
+                prepared_model.eval()
+                model = convert(prepared_model)
+                model = torch.jit.trace(model, jit_inputs, strict=False)
+            model = torch.jit.freeze(model)
+            # enable fusion path work(need to run two interation)
+            with torch.no_grad():
+                print(example_input)
+                y = model(**example_input)
+                y = model(**example_input)
+
         for step, inputs in enumerate(dataloader):
             # Update the observed num examples
             observed_batch_size = find_batch_size(inputs)
@@ -3311,6 +3372,7 @@ class Trainer:
             logits and labels (each being optional).
         """
         has_labels = False if len(self.label_names) == 0 else all(inputs.get(k) is not None for k in self.label_names)
+        has_labels = False
         # For CLIP-like models capable of returning loss values.
         # If `return_loss` is not specified or being `None` in `inputs`, we check if the default value of `return_loss`
         # is `True` in `model.forward`.
