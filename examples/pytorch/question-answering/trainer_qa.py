@@ -59,36 +59,58 @@ class QuestionAnsweringTrainer(Trainer):
                     L1.append(dumpy_tensor)
                     jit_inputs=tuple(L1)
                 break
-            if use_ipex:
-                if bf16:
-                    self.model = ipex.optimize(self.model.to(memory_format=torch.channels_last), dtype=torch.bfloat16, level="O1")
-                    with torch.cpu.amp.autocast(), torch.no_grad():
-                        self.model = torch.jit.trace(self.model, jit_inputs, strict=False)
-                    self.model = torch.jit.freeze(self.model)
-                else:
-                    self.model = ipex.optimize(self.model.to(memory_format=torch.channels_last), dtype=torch.float32, level="O1")
-                    with torch.no_grad():
-                        self.model = torch.jit.trace(self.model, jit_inputs, strict=False)
-                    self.model = torch.jit.freeze(self.model)
-            else:
-                if bf16:
-                    with torch.cpu.amp.autocast(), torch.no_grad():
-                        self.model = torch.jit.trace(self.model.to(memory_format=torch.channels_last), jit_inputs, strict=False)
-                    self.model = torch.jit.freeze(self.model)
-                    with torch.no_grad():
-                        for _,batch in enumerate(eval_dataloader):
-                            for _,label in enumerate(batch):
-                                if batch[label].dim() >=4:
-                                    batch[label]=batch[label].to(memory_format=torch.channels_last)
-                else:
-                    with torch.no_grad():
-                        self.model = torch.jit.trace(self.model.to(memory_format=torch.channels_last), jit_inputs, strict=False)
-                    self.model = torch.jit.freeze(self.model)
-                    with torch.no_grad():
-                        for _,batch in enumerate(eval_dataloader):
-                            for _,label in enumerate(batch):
-                                if batch[label].dim() >=4:
-                                    batch[label]=batch[label].to(memory_format=torch.channels_last)
+            # if use_ipex:
+            #     from intel_extension_for_pytorch.quantization import prepare, convert
+            #     from torch.ao.quantization import MinMaxObserver, PerChannelMinMaxObserver, QConfig
+            #     qconfig = QConfig(activation=MinMaxObserver.with_args(qscheme=torch.per_tensor_affine, dtype=torch.quint8), weight=PerChannelMinMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_channel_symmetric))
+            #     self.model = prepare(self.model, qconfig, example_inputs=jit_inputs, inplace=False)
+            #     self.model.load_qconf_summary(qconf_summary = "./configure.json")
+            #     if bf16:
+            #         # self.model = ipex.optimize(self.model.to(memory_format=torch.channels_last), dtype=torch.bfloat16, level="O1")
+            #         with torch.cpu.amp.autocast(), torch.no_grad():
+            #             self.model = convert(self.model)
+            #             self.model = torch.jit.trace(self.model, jit_inputs, strict=False)
+            #         self.model = torch.jit.freeze(self.model)
+            #     else:
+            #         # self.model = ipex.optimize(self.model.to(memory_format=torch.channels_last), dtype=torch.float32, level="O1")
+            #         with torch.no_grad():
+            #             self.model = torch.jit.trace(self.model, jit_inputs, strict=False)
+            #         self.model = torch.jit.freeze(self.model)
+            # else:
+            #     if bf16:
+            #         with torch.cpu.amp.autocast(), torch.no_grad():
+            #             self.model = torch.jit.trace(self.model.to(memory_format=torch.channels_last), jit_inputs, strict=False)
+            #         self.model = torch.jit.freeze(self.model)
+            #         with torch.no_grad():
+            #             for _,batch in enumerate(eval_dataloader):
+            #                 for _,label in enumerate(batch):
+            #                     if batch[label].dim() >=4:
+            #                         batch[label]=batch[label].to(memory_format=torch.channels_last)
+            #     else:
+            #         with torch.no_grad():
+            #             self.model = torch.jit.trace(self.model.to(memory_format=torch.channels_last), jit_inputs, strict=False)
+            #         self.model = torch.jit.freeze(self.model)
+            #         with torch.no_grad():
+            #             for _,batch in enumerate(eval_dataloader):
+            #                 for _,label in enumerate(batch):
+            #                     if batch[label].dim() >=4:
+            #                         batch[label]=batch[label].to(memory_format=torch.channels_last)
+            import intel_extension_for_pytorch as ipex_
+            from intel_extension_for_pytorch.quantization import prepare
+            from torch.ao.quantization import MinMaxObserver, PerChannelMinMaxObserver, QConfig
+            qconfig = QConfig(activation=MinMaxObserver.with_args(qscheme=torch.per_tensor_affine, dtype=torch.quint8), weight=PerChannelMinMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_channel_symmetric))
+            ipex_.nn.utils._model_convert.replace_dropout_with_identity(self.model)
+            self.model = prepare(self.model, qconfig, example_inputs=jit_inputs, inplace=False)
+            output = eval_loop(
+                eval_dataloader,
+                description="Evaluation",
+                # No point gathering the predictions if there are no metrics, otherwise we defer to
+                # self.args.prediction_loss_only
+                prediction_loss_only=True if compute_metrics is None else None,
+                ignore_keys=ignore_keys,
+            )
+            self.model.save_qconf_summary(qconf_summary = "./configure.json")
+            exit()
         else:
             if use_ipex:
                 if bf16:
@@ -251,4 +273,4 @@ class QuestionAnsweringTrainer(Trainer):
             if not key.startswith(f"{metric_key_prefix}_"):
                 metrics[f"{metric_key_prefix}_{key}"] = metrics.pop(key)
 
-        return PredictionOutput(predictions=predictions.predictions, label_ids=predictions.label_ids, metrics=metrics)
+        return PredictionOutput(predictions=predictions.predictions, label_ids=
