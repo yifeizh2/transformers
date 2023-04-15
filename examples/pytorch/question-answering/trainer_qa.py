@@ -60,13 +60,19 @@ class QuestionAnsweringTrainer(Trainer):
                     jit_inputs=tuple(L1)
                 break
             if use_ipex:
+                from intel_extension_for_pytorch.quantization import prepare, convert
+                from torch.ao.quantization import MinMaxObserver, PerChannelMinMaxObserver, QConfig
+                qconfig = QConfig(activation=MinMaxObserver.with_args(qscheme=torch.per_tensor_affine, dtype=torch.quint8), weight=PerChannelMinMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_channel_symmetric))
+                self.model = prepare(self.model, qconfig, example_inputs=jit_inputs, inplace=False)
+                self.model.load_qconf_summary(qconf_summary = "./configure.json")
                 if bf16:
-                    self.model = ipex.optimize(self.model.to(memory_format=torch.channels_last), dtype=torch.bfloat16, level="O1")
+                    # self.model = ipex.optimize(self.model.to(memory_format=torch.channels_last), dtype=torch.bfloat16, level="O1")
                     with torch.cpu.amp.autocast(), torch.no_grad():
+                        self.model = convert(self.model)
                         self.model = torch.jit.trace(self.model, jit_inputs, strict=False)
                     self.model = torch.jit.freeze(self.model)
                 else:
-                    self.model = ipex.optimize(self.model.to(memory_format=torch.channels_last), dtype=torch.float32, level="O1")
+                    # self.model = ipex.optimize(self.model.to(memory_format=torch.channels_last), dtype=torch.float32, level="O1")
                     with torch.no_grad():
                         self.model = torch.jit.trace(self.model, jit_inputs, strict=False)
                     self.model = torch.jit.freeze(self.model)
