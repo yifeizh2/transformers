@@ -85,7 +85,18 @@ class ModelArguments:
             "with private models)."
         },
     )
-
+    use_ipex: bool = field(
+        default=False, metadata={"help": "Choose if use intel extension for pytorch, dafault is just use pytorch"}
+    )
+    jit_mode: bool = field(
+        default=False, metadata={"help": "Choose if run with jit mode, default is imperative mode"}
+    )
+    bf16: bool = field(
+        default=False, metadata={"help": "Enable bf16 mix-precision"}
+    )
+    profile: bool = field(
+        default=False, metadata={"help": "Choose if run with torch profile tools"}
+    )
 
 @dataclass
 class DataTrainingArguments:
@@ -601,7 +612,7 @@ def main():
     # Evaluation
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
-        metrics = trainer.evaluate()
+        metrics = trainer.evaluate(profile=model_args.profile, use_ipex =model_args.use_ipex, bf16=model_args.bf16, jit_mode=model_args.jit_mode, max_seq_length=data_args.max_seq_length)
 
         max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
         metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))

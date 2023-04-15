@@ -2208,9 +2208,16 @@ class Trainer:
         all_labels = None
         # Will be useful when we have an iterable dataset so don't know its length.
 
+        # record iteration start time
+        iter_num = 0
+        warm_up_num = 10
+        # record iteration number
         observed_num_examples = 0
+        total_time = 0
         # Main evaluation loop
         for step, inputs in enumerate(dataloader):
+            iter_num = iter_num + 1
+
             # Update the observed num examples
             observed_batch_size = find_batch_size(inputs)
             if observed_batch_size is not None:
@@ -2220,7 +2227,10 @@ class Trainer:
                     batch_size = observed_batch_size
 
             # Prediction step
+            start_time = time.time()
             loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+            if iter_num > warm_up_num:
+                total_time += time.time() - start_time
 
             # Update containers on host
             if loss is not None:
@@ -2252,6 +2262,9 @@ class Trainer:
 
                 # Set back to None to begin a new accumulation
                 losses_host, preds_host, labels_host = None, None, None
+
+        throughput = self.args.eval_batch_size * (iter_num - warm_up_num) / total_time
+        print("Throughput: {:.3f} sentence/s".format(throughput))
 
         if self.args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of the evaluation loop
