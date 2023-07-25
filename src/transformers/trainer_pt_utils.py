@@ -132,12 +132,16 @@ def find_batch_size(tensors):
         return tensors.shape[0] if len(tensors.shape) >= 1 else None
 
 
-def nested_numpify(tensors):
+def nested_numpify(tensors, precision):
     "Numpify `tensors` (even if it's a nested list/tuple of tensors)."
     if isinstance(tensors, (list, tuple)):
-        return type(tensors)(nested_numpify(t) for t in tensors)
-    return tensors.cpu().numpy()
-
+        return type(tensors)(nested_numpify(t, precision) for t in tensors)
+    if precision == 'bfloat16':
+        return tensors.cpu().float().numpy()
+    elif precision == 'int8':
+        return tensors.cpu().float().numpy()
+    else:
+        return tensors.cpu().numpy()
 
 def nested_detach(tensors):
     "Detach `tensors` (even if it's a nested list/tuple of tensors)."

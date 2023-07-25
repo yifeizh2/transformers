@@ -19,6 +19,7 @@
 
 
 import math
+import os
 
 import numpy as np
 import torch
@@ -82,8 +83,12 @@ def create_sinusoidal_embeddings(n_pos, dim, out):
 class Embeddings(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.word_embeddings = nn.Embedding(config.vocab_size, config.dim, padding_idx=config.pad_token_id)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.dim)
+        if config.precision == "bfloat16":
+            self.word_embeddings = nn.Embedding(config.vocab_size, config.dim, padding_idx=config.pad_token_id, dtype=torch.bfloat16)
+            self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.dim, dtype=torch.bfloat16)
+        else:
+            self.word_embeddings = nn.Embedding(config.vocab_size, config.dim, padding_idx=config.pad_token_id)
+            self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.dim)
         if config.sinusoidal_pos_embds:
 
             if is_deepspeed_zero3_enabled():
@@ -480,7 +485,8 @@ class DistilBertModel(DistilBertPreTrainedModel):
 
         if attention_mask is None:
             attention_mask = torch.ones(input_shape, device=device)  # (bs, seq_length)
-
+        if self.config.precision == "bfloat16":
+            attention_mask = attention_mask.to(torch.bfloat16)
         # Prepare head mask if needed
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
 
@@ -530,9 +536,9 @@ class DistilBertForMaskedLM(DistilBertPreTrainedModel):
         self,
         input_ids=None,
         attention_mask=None,
+        labels=None,
         head_mask=None,
         inputs_embeds=None,
-        labels=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -605,11 +611,11 @@ class DistilBertForSequenceClassification(DistilBertPreTrainedModel):
     )
     def forward(
         self,
-        input_ids=None,
+        labels=None,
         attention_mask=None,
+        input_ids=None,
         head_mask=None,
         inputs_embeds=None,
-        labels=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -796,11 +802,11 @@ class DistilBertForTokenClassification(DistilBertPreTrainedModel):
     )
     def forward(
         self,
-        input_ids=None,
+        labels=None,
         attention_mask=None,
+        input_ids=None,
         head_mask=None,
         inputs_embeds=None,
-        labels=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -879,9 +885,9 @@ class DistilBertForMultipleChoice(DistilBertPreTrainedModel):
         self,
         input_ids=None,
         attention_mask=None,
+        labels=None,
         head_mask=None,
         inputs_embeds=None,
-        labels=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,

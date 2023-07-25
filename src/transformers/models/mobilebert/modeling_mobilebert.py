@@ -1229,13 +1229,13 @@ class MobileBertForSequenceClassification(MobileBertPreTrainedModel):
     )
     def forward(
         self,
+        labels=None,
         input_ids=None,
-        attention_mask=None,
         token_type_ids=None,
+        attention_mask=None,
         position_ids=None,
         head_mask=None,
-        inputs_embeds=None,
-        labels=None,
+        inputs_embeds=None,    
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,

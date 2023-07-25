@@ -175,6 +175,8 @@ if is_sagemaker_mp_enabled():
 if TYPE_CHECKING:
     import optuna
 
+import time
+
 logger = logging.get_logger(__name__)
 
 
@@ -1256,7 +1258,6 @@ class Trainer:
             self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
             for step, inputs in enumerate(epoch_iterator):
-
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
@@ -1784,9 +1785,17 @@ class Trainer:
 
         if self.use_amp:
             with autocast():
-                loss = self.compute_loss(model, inputs)
+                if self.args.precision == 'bfloat16':
+                    with torch.cpu.amp.autocast(enabled=True, dtype=torch.bfloat16):
+                        loss = self.compute_loss(model, inputs)
+                else:
+                    loss = self.compute_loss(model, inputs)
         else:
-            loss = self.compute_loss(model, inputs)
+            if self.args.precision == 'bfloat16':
+                with torch.cpu.amp.autocast(enabled=True, dtype=torch.bfloat16):
+                    loss = self.compute_loss(model, inputs)
+            else:
+                loss = self.compute_loss(model, inputs)
 
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -1818,7 +1827,18 @@ class Trainer:
             labels = inputs.pop("labels")
         else:
             labels = None
-        outputs = model(**inputs)
+        
+            if self.args.torchdynamo_ipex:
+                import torchdynamo
+                from torchdynamo.optimizations import backends
+                if self.args.precision == "float32":
+                    with torchdynamo.optimize(backends.ipex_fp32), torch.no_grad():
+                        outputs = model(**inputs)
+                if self.args.precision == "bfloat16":
+                    with torchdynamo.optimize(backends.ipex_bf16), torch.no_grad(), torch.cpu.amp.autocast():
+                        outputs = model(**inputs)
+            else:
+                outputs = model(**inputs)
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
         if self.args.past_index >= 0:
@@ -2045,18 +2065,32 @@ class Trainer:
         self._memory_tracker.start()
 
         eval_dataloader = self.get_eval_dataloader(eval_dataset)
+        print('--------------------', len(eval_dataloader))
         start_time = time.time()
 
         eval_loop = self.prediction_loop if self.args.use_legacy_prediction_loop else self.evaluation_loop
-        output = eval_loop(
-            eval_dataloader,
-            description="Evaluation",
-            # No point gathering the predictions if there are no metrics, otherwise we defer to
-            # self.args.prediction_loss_only
-            prediction_loss_only=True if self.compute_metrics is None else None,
-            ignore_keys=ignore_keys,
-            metric_key_prefix=metric_key_prefix,
-        )
+        print("[INFO|benchmark log] Running evaluate() ...")
+        if self.args.use_shared_weight:
+            print("[INFO|benchmark log] Running weight sharing mode ...")
+            import threading
+            threads = []
+            num_instances = self.args.total_cores // self.args.cores_per_instance
+            for i in range(0, num_instances):
+                t = threading.Thread(target=eval_loop, args=(eval_dataloader, "Evaluation", True, ignore_keys, metric_key_prefix))
+                threads.append(t)
+                t.start()
+            for t in threads:
+                t.join()
+        else:
+            output = eval_loop(
+                eval_dataloader,
+                description="Evaluation",
+                # No point gathering the predictions if there are no metrics, otherwise we defer to
+                # self.args.prediction_loss_only
+                prediction_loss_only=True if self.compute_metrics is None else None,
+                ignore_keys=ignore_keys,
+                metric_key_prefix=metric_key_prefix,
+            )
 
         total_batch_size = self.args.eval_batch_size * self.args.world_size
         output.metrics.update(
@@ -2120,6 +2154,7 @@ class Trainer:
         start_time = time.time()
 
         eval_loop = self.prediction_loop if self.args.use_legacy_prediction_loop else self.evaluation_loop
+        print("[INFO|benchmark log] Running predict() ...")
         output = eval_loop(
             test_dataloader, description="Prediction", ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix
         )
@@ -2210,48 +2245,427 @@ class Trainer:
 
         observed_num_examples = 0
         # Main evaluation loop
-        for step, inputs in enumerate(dataloader):
-            # Update the observed num examples
-            observed_batch_size = find_batch_size(inputs)
-            if observed_batch_size is not None:
-                observed_num_examples += observed_batch_size
-                # For batch samplers, batch_size is not known by the dataloader in advance.
-                if batch_size is None:
-                    batch_size = observed_batch_size
+        total_time = 0
+        total_data = 0
+        
+        if self.args.ipex:
+            # Import Extension
+            import intel_extension_for_pytorch as ipex
+            print("[INFO|benchmark log] Running with IPEX...")
+            if self.args.precision == 'bfloat16':
+                # Automatically mix precision
+                model = ipex.optimize(model, dtype=torch.bfloat16) #ipex.enable_auto_mixed_precision(mixed_dtype=torch.bfloat16)
+                print("[INFO|benchmark log] Running with bfloat16...")
+            if self.args.mkl_backend:
+                print("using mkl backend for blas")
+                ipex._set_blas_backend(backend="mkl")
+            if self.args.precision != 'int8':    
+                model = ipex.optimize(model, dtype=torch.float32, auto_kernel_selection=self.args.auto_kernel_selection)
+        if self.args.precision == 'int8':
+            # create inputs for quantization
+            jit_inputs=()
+            example_input = None
+            for _,batch in enumerate(dataloader):
+                example_input = batch
+                for _,label in enumerate(batch): 
+                    if (batch[label].dim()) >=4:
+                        dumpy_tensor = torch.ones((batch[label].shape), dtype=torch.long).to(memory_format=torch.channels_last)
+                    else:
+                        dumpy_tensor = torch.ones((batch[label].shape), dtype=torch.long)
+                    #if  dumpy_tensor.shape!=torch.Size([1]):
+                    L1=list(jit_inputs)
+                    L1.append(dumpy_tensor)
+                    jit_inputs=tuple(L1)
+                break
+            from intel_extension_for_pytorch.quantization import prepare, convert
+            from torch.ao.quantization import MinMaxObserver, PerChannelMinMaxObserver, QConfig
+            # qconfig = torch.quantization.default_qconfig # this line is default qconfig, below line is Jianan's qconfig
+            import intel_extension_for_pytorch as ipex
+            qconfig = QConfig(activation=MinMaxObserver.with_args(qscheme=torch.per_tensor_affine, dtype=torch.quint8), weight=PerChannelMinMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_channel_symmetric))
+            ipex.nn.utils._model_convert.replace_dropout_with_identity(model)
+            prepared_model = prepare(model, qconfig, example_inputs=jit_inputs, inplace=False)
+            # prepared_model.load_qconf_summary(qconf_summary = "") # self.args.int8_config == ""
+            for i in range(10):    
+                prepared_model(**example_input)
+            # convert model to trace model.
+            if False: # self.args.mix_bf16 == False
+                with torch.cpu.amp.autocast():
+                    model = convert(prepared_model)
+                    model = torch.jit.trace(model, jit_inputs, strict=False)
+            else:
+                prepared_model.eval()
+                model = convert(prepared_model)
+                model = torch.jit.trace(model, jit_inputs, strict=False)
+            model = torch.jit.freeze(model)
+            # enable fusion path work(need to run two interation)
+            with torch.no_grad():
+                y = model(**example_input)
+                y = model(**example_input)
+        if self.args.channels_last:
+            model_oob = model
+            try:
+                model_oob = model_oob.to(memory_format=torch.channels_last)
+            except:
+                pass
+            model = model_oob
+        if self.args.jit and self.args.precision != 'int8':
+            jit_inputs=()
+            # print("------------------trace input order before jit")
+            # print("model forward func path: ", model.forward.__code__)
+            for _,batch in enumerate(dataloader):
+                for _,label in enumerate(batch): 
+                    # print(label)
+                    if (batch[label].dim()) >=4:
+                        dumpy_tensor = torch.ones((batch[label].shape), dtype=torch.long).to(memory_format=torch.channels_last)
+                    else:
+                        dumpy_tensor = torch.ones((batch[label].shape), dtype=torch.long)
+                    L1=list(jit_inputs)
+                    L1.append(dumpy_tensor)
+                    jit_inputs=tuple(L1)
+                break
+            if self.args.jit_optimize: 
+                model = torch.jit.optimize_for_inference(torch.jit.trace(model, jit_inputs, strict=False))
+                print("[INFO|benchmark log] Running with JIT and jit.optimize_for_inference API ...")
+            else:
+                model = torch.jit.trace(model, jit_inputs, strict=False)
+                model = torch.jit.freeze(model)
+                print("[INFO|benchmark log] Running with JIT ...")
+        batch_size_ = 0
+        if self.args.precision == 'bfloat16':
+            with torch.cpu.amp.autocast(enabled=True, dtype=torch.bfloat16):
+                if not self.args.dnnlverbose:
+                    itcount = 0
+                    num_loop = 1
+                    if ((self.num_examples(dataloader)//batch_size)+1) < self.args.minimum_iter:
+                        num_loop = self.args.minimum_iter//((self.num_examples(dataloader)//batch_size)+1)
+                    total_iter = num_loop*((self.num_examples(dataloader)//batch_size)+1)
+                    t_arr = np.empty((0,1))
+                    # print("total_iter = ", total_iter)
+                    for step, inputs in enumerate(dataloader):
+                        if itcount == self.args.early_stop_at_iter or step == (self.num_examples(dataloader)//batch_size):
+                            break
+                        for repeat in range(num_loop):
+                            itcount = itcount + 1
+                            # Update the observed num examples
+                            observed_batch_size = find_batch_size(inputs)
+                            if observed_batch_size is not None:
+                                observed_num_examples += observed_batch_size
+                                # For batch samplers, batch_size is not known by the dataloader in advance.
+                                if batch_size is None:
+                                    batch_size = observed_batch_size
+                            if self.args.ipex:
+                                inputs = inputs #inputs = {key:ipex.optimize(value) for key,value in inputs.items()}
+                            if self.args.channels_last:
+                                input_oob = inputs
+                                try:
+                                    input_oob = {key:value.to(memory_format=torch.channels_last) for key,value in input_oob.items()}
+                                except:
+                                    pass
+                                inputs = input_oob
 
-            # Prediction step
-            loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+                            # Prediction step
+                            tic = time.time()
+                            loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+                            toc = time.time()
+                            #loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
 
-            # Update containers on host
-            if loss is not None:
-                losses = self._nested_gather(loss.repeat(batch_size))
-                losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
-            if logits is not None:
-                logits = self._pad_across_processes(logits)
-                logits = self._nested_gather(logits)
-                preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
-            if labels is not None:
-                labels = self._pad_across_processes(labels)
-                labels = self._nested_gather(labels)
-                labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
-            self.control = self.callback_handler.on_prediction_step(self.args, self.state, self.control)
+                            # Update containers on host
+                            if loss is not None:
+                                losses = self._nested_gather(loss.repeat(batch_size))
+                                losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
+                            if logits is not None:
+                                logits = self._pad_across_processes(logits)
+                                logits = self._nested_gather(logits)
+                                preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
+                            if labels is not None:
+                                labels = self._pad_across_processes(labels)
+                                labels = self._nested_gather(labels)
+                                labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
+                            self.control = self.callback_handler.on_prediction_step(self.args, self.state, self.control)
+                                
+                            # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
+                            if self.args.eval_accumulation_steps is not None and (step + 1) % self.args.eval_accumulation_steps == 0:
+                                if losses_host is not None:
+                                    losses = nested_numpify(losses_host, self.args.precision)
+                                    all_losses = losses if all_losses is None else np.concatenate((all_losses, losses), axis=0)
+                                if preds_host is not None:
+                                    logits = nested_numpify(preds_host, self.args.precision)
+                                    all_preds = logits if all_preds is None else nested_concat(all_preds, logits, padding_index=-100)
+                                if labels_host is not None:
+                                    labels = nested_numpify(labels_host, self.args.precision)
+                                    all_labels = (
+                                        labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
+                                    )
 
-            # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
-            if self.args.eval_accumulation_steps is not None and (step + 1) % self.args.eval_accumulation_steps == 0:
-                if losses_host is not None:
-                    losses = nested_numpify(losses_host)
-                    all_losses = losses if all_losses is None else np.concatenate((all_losses, losses), axis=0)
-                if preds_host is not None:
-                    logits = nested_numpify(preds_host)
-                    all_preds = logits if all_preds is None else nested_concat(all_preds, logits, padding_index=-100)
-                if labels_host is not None:
-                    labels = nested_numpify(labels_host)
-                    all_labels = (
-                        labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
-                    )
+                                # Set back to None to begin a new accumulation
+                                losses_host, preds_host, labels_host = None, None, None
+                            # toc = time.time()
+                            # print("elapsed time = ", toc - tic)
+                            if itcount > self.args.num_warmup_iter and itcount < (total_iter - self.args.num_warmup_iter):
+                                # print("------------------------------elapsed time for calc = ", toc - tic)
+                                t_arr = np.append(t_arr, toc - tic)
+                                total_time += toc - tic
+                                total_data += batch_size
+                                batch_size_ = batch_size
+                # print("t_arr = ", t_arr)
+                print("t_arr var. = ", np.std(t_arr)/np.mean(t_arr))
+                print(" time cost %s\n total samples %s \n inference latency: %s s\n inference Throughput: %s images/s\n " %(total_time, total_data, total_time / total_data, total_data / total_time))
+                print("output latency: ", round(total_time /total_data, 3))
+                print("output throughput: ", round(total_data / total_time, 3))
+                print("output batch size: ", batch_size_)
+        else:
+            if self.args.precision == 'int8' and self.args.dynamic_shape:
+                for big_loop in range(2):
+                    total_time, total_data=0,0
+                    if big_loop==1:
+                        print('==================Performance Details========================')
+                    elif big_loop==0:
+                        print('==================Warm-up(Whole Datasets) Performance Details========================')
+                    if big_loop==0:
+                        itcount = 0
+                        num_loop = 1
+                        if ((self.num_examples(dataloader)//batch_size)+1) < self.args.minimum_iter:
+                            num_loop = self.args.minimum_iter//((self.num_examples(dataloader)//batch_size)+1)
+                        total_iter = num_loop*((self.num_examples(dataloader)//batch_size)+1)
+                        t_arr = np.empty((0,1))
+                        # print("total_iter = ", total_iter)
+                        for step, inputs in enumerate(dataloader):
+                            #for x in inputs:
+                                #print("label:{}, shape:{}".format(x, inputs[x].shape))
+                            if itcount == self.args.early_stop_at_iter or step == (self.num_examples(dataloader)//batch_size):
+                                break
+                            for repeat in range(num_loop):
+                                itcount = itcount + 1
+                                # Update the observed num examples
+                                observed_batch_size = find_batch_size(inputs)
+                                if observed_batch_size is not None:
+                                    observed_num_examples += observed_batch_size
+                                    # For batch samplers, batch_size is not known by the dataloader in advance.
+                                    if batch_size is None:
+                                        batch_size = observed_batch_size
+                                if self.args.ipex:
+                                    inputs = inputs #inputs = {key:ipex.optimize(value) for key,value in inputs.items()}
+                                if self.args.channels_last:
+                                    input_oob = inputs
+                                    try:
+                                        input_oob = {key:value.to(memory_format=torch.channels_last) for key,value in input_oob.items()}
+                                    except:
+                                        pass
+                                    inputs = input_oob
+                                
+                                # Prediction step
+                                tic = time.time()
+                                loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+                                toc = time.time()
+                                #loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
 
-                # Set back to None to begin a new accumulation
-                losses_host, preds_host, labels_host = None, None, None
+                                # Update containers on host
+                                if loss is not None:
+                                    losses = self._nested_gather(loss.repeat(batch_size))
+                                    losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
+                                if logits is not None:
+                                    logits = self._pad_across_processes(logits)
+                                    logits = self._nested_gather(logits)
+                                    preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
+                                if labels is not None:
+                                    labels = self._pad_across_processes(labels)
+                                    labels = self._nested_gather(labels)
+                                    labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
+                                self.control = self.callback_handler.on_prediction_step(self.args, self.state, self.control)
+                                    
+                                # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
+                                if self.args.eval_accumulation_steps is not None and (step + 1) % self.args.eval_accumulation_steps == 0:
+                                    if losses_host is not None:
+                                        losses = nested_numpify(losses_host, self.args.precision)
+                                        all_losses = losses if all_losses is None else np.concatenate((all_losses, losses), axis=0)
+                                    if preds_host is not None:
+                                        logits = nested_numpify(preds_host, self.args.precision)
+                                        all_preds = logits if all_preds is None else nested_concat(all_preds, logits, padding_index=-100)
+                                    if labels_host is not None:
+                                        labels = nested_numpify(labels_host, self.args.precision)
+                                        all_labels = (
+                                            labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
+                                        )
+
+                                    # Set back to None to begin a new accumulation
+                                    losses_host, preds_host, labels_host = None, None, None
+                                # toc = time.time()
+                                # print("elapsed time = ", toc - tic)
+                                
+                                # print("------------------------------elapsed time for calc = ", toc - tic)
+                                t_arr = np.append(t_arr, toc - tic)
+                                total_time += toc - tic
+                                total_data += batch_size
+                                batch_size_ = batch_size
+                    elif big_loop==1:
+                        itcount = 0
+                        num_loop = 1
+                        if ((self.num_examples(dataloader)//batch_size)+1) < self.args.minimum_iter:
+                            num_loop = self.args.minimum_iter//((self.num_examples(dataloader)//batch_size)+1)
+                        total_iter = num_loop*((self.num_examples(dataloader)//batch_size)+1)
+                        t_arr = np.empty((0,1))
+                        if self.args.profile:
+                            # print("total_iter = ", total_iter)
+                            def trace_handler(prof):
+                                print(prof.key_averages().table(
+                                    sort_by="self_cpu_time_total", row_limit=-1))
+                            with torch.profiler.profile(
+                                activities=[
+                                    torch.profiler.ProfilerActivity.CPU,    
+                                ],
+                                schedule=torch.profiler.schedule(
+                                    wait=10,
+                                    warmup=10,
+                                    active=5),
+                                on_trace_ready=trace_handler
+                            ) as prof:
+                                for step, inputs in enumerate(dataloader):
+                                    #for x in inputs:
+                                        #print("label:{}, shape:{}".format(x, inputs[x].shape))
+                                    if itcount == self.args.early_stop_at_iter or step == (self.num_examples(dataloader)//batch_size):
+                                        break
+                                    for repeat in range(num_loop):
+                                        itcount = itcount + 1
+                                        # Update the observed num examples
+                                        observed_batch_size = find_batch_size(inputs)
+                                        if observed_batch_size is not None:
+                                            observed_num_examples += observed_batch_size
+                                            # For batch samplers, batch_size is not known by the dataloader in advance.
+                                            if batch_size is None:
+                                                batch_size = observed_batch_size
+                                        if self.args.ipex:
+                                            inputs = inputs #inputs = {key:ipex.optimize(value) for key,value in inputs.items()}
+                                        if self.args.channels_last:
+                                            input_oob = inputs
+                                            try:
+                                                input_oob = {key:value.to(memory_format=torch.channels_last) for key,value in input_oob.items()}
+                                            except:
+                                                pass
+                                            inputs = input_oob
+                                        
+                                        # Prediction step
+                                        tic = time.time()
+                                        loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+                                        toc = time.time()
+                                        #loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+                                        prof.step()
+                                        # Update containers on host
+                                        if loss is not None:
+                                            losses = self._nested_gather(loss.repeat(batch_size))
+                                            losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
+                                        if logits is not None:
+                                            logits = self._pad_across_processes(logits)
+                                            logits = self._nested_gather(logits)
+                                            preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
+                                        if labels is not None:
+                                            labels = self._pad_across_processes(labels)
+                                            labels = self._nested_gather(labels)
+                                            labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
+                                        self.control = self.callback_handler.on_prediction_step(self.args, self.state, self.control)
+                                            
+                                        # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
+                                        if self.args.eval_accumulation_steps is not None and (step + 1) % self.args.eval_accumulation_steps == 0:
+                                            if losses_host is not None:
+                                                losses = nested_numpify(losses_host, self.args.precision)
+                                                all_losses = losses if all_losses is None else np.concatenate((all_losses, losses), axis=0)
+                                            if preds_host is not None:
+                                                logits = nested_numpify(preds_host, self.args.precision)
+                                                all_preds = logits if all_preds is None else nested_concat(all_preds, logits, padding_index=-100)
+                                            if labels_host is not None:
+                                                labels = nested_numpify(labels_host, self.args.precision)
+                                                all_labels = (
+                                                    labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
+                                                )
+
+                                            # Set back to None to begin a new accumulation
+                                            losses_host, preds_host, labels_host = None, None, None
+                                        # toc = time.time()
+                                        # print("elapsed time = ", toc - tic)
+                                        
+                                        # print("------------------------------elapsed time for calc = ", toc - tic)
+                                        t_arr = np.append(t_arr, toc - tic)
+                                        total_time += toc - tic
+                                        total_data += batch_size
+                                        batch_size_ = batch_size
+                        else:
+                            for step, inputs in enumerate(dataloader):
+                                #for x in inputs:
+                                    #print("label:{}, shape:{}".format(x, inputs[x].shape))
+                                if itcount == self.args.early_stop_at_iter or step == (self.num_examples(dataloader)//batch_size):
+                                    break
+                                for repeat in range(num_loop):
+                                    itcount = itcount + 1
+                                    # Update the observed num examples
+                                    observed_batch_size = find_batch_size(inputs)
+                                    if observed_batch_size is not None:
+                                        observed_num_examples += observed_batch_size
+                                        # For batch samplers, batch_size is not known by the dataloader in advance.
+                                        if batch_size is None:
+                                            batch_size = observed_batch_size
+                                    if self.args.ipex:
+                                        inputs = inputs #inputs = {key:ipex.optimize(value) for key,value in inputs.items()}
+                                    if self.args.channels_last:
+                                        input_oob = inputs
+                                        try:
+                                            input_oob = {key:value.to(memory_format=torch.channels_last) for key,value in input_oob.items()}
+                                        except:
+                                            pass
+                                        inputs = input_oob
+                                    
+                                    # Prediction step
+                                    tic = time.time()
+                                    loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+                                    toc = time.time()
+                                    #loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+                                    # prof.step()
+                                    # Update containers on host
+                                    if loss is not None:
+                                        losses = self._nested_gather(loss.repeat(batch_size))
+                                        losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
+                                    if logits is not None:
+                                        logits = self._pad_across_processes(logits)
+                                        logits = self._nested_gather(logits)
+                                        preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
+                                    if labels is not None:
+                                        labels = self._pad_across_processes(labels)
+                                        labels = self._nested_gather(labels)
+                                        labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
+                                    self.control = self.callback_handler.on_prediction_step(self.args, self.state, self.control)
+                                        
+                                    # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
+                                    if self.args.eval_accumulation_steps is not None and (step + 1) % self.args.eval_accumulation_steps == 0:
+                                        if losses_host is not None:
+                                            losses = nested_numpify(losses_host, self.args.precision)
+                                            all_losses = losses if all_losses is None else np.concatenate((all_losses, losses), axis=0)
+                                        if preds_host is not None:
+                                            logits = nested_numpify(preds_host, self.args.precision)
+                                            all_preds = logits if all_preds is None else nested_concat(all_preds, logits, padding_index=-100)
+                                        if labels_host is not None:
+                                            labels = nested_numpify(labels_host, self.args.precision)
+                                            all_labels = (
+                                                labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
+                                            )
+
+                                        # Set back to None to begin a new accumulation
+                                        losses_host, preds_host, labels_host = None, None, None
+                                    # toc = time.time()
+                                    # print("elapsed time = ", toc - tic)
+                                    
+                                    # print("------------------------------elapsed time for calc = ", toc - tic)
+                                    t_arr = np.append(t_arr, toc - tic)
+                                    total_time += toc - tic
+                                    total_data += batch_size
+                                    batch_size_ = batch_size
+                                
+                        print("t_arr var. = ", np.std(t_arr)/np.mean(t_arr))
+                        print(" time cost %s\n total samples %s \n inference latency: %s s\n inference Throughput: %s images/s\n " %(total_time, total_data, total_time / total_data, total_data / total_time))
+                        print("output latency: ", round(total_time /total_data, 3))
+                        print("output throughput: ", round(total_data / total_time, 3))
+                        print("total_data" , total_data,total_time)
+                        print("total_time" , total_time)
+                        print("output batch size: ", batch_size_)                    
+
+
 
         if self.args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of the evaluation loop
@@ -2259,13 +2673,13 @@ class Trainer:
 
         # Gather all remaining tensors and put them back on the CPU
         if losses_host is not None:
-            losses = nested_numpify(losses_host)
+            losses = nested_numpify(losses_host, self.args.precision)
             all_losses = losses if all_losses is None else np.concatenate((all_losses, losses), axis=0)
         if preds_host is not None:
-            logits = nested_numpify(preds_host)
+            logits = nested_numpify(preds_host, self.args.precision)
             all_preds = logits if all_preds is None else nested_concat(all_preds, logits, padding_index=-100)
         if labels_host is not None:
-            labels = nested_numpify(labels_host)
+            labels = nested_numpify(labels_host, self.args.precision)
             all_labels = labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
 
         # Number of samples
@@ -2289,7 +2703,7 @@ class Trainer:
 
         # Metrics!
         if self.compute_metrics is not None and all_preds is not None and all_labels is not None:
-            metrics = self.compute_metrics(EvalPrediction(predictions=all_preds, label_ids=all_labels))
+            metrics = self.compute_metrics(EvalPrediction(predictions=all_preds, label_ids=all_labels.astype(np.int_)))
         else:
             metrics = {}
 
@@ -2432,9 +2846,19 @@ class Trainer:
                         logits = outputs[1:]
                 else:
                     loss = None
-                    if self.use_amp:
-                        with autocast():
-                            outputs = model(**inputs)
+                    # if self.use_amp:
+                        # with autocast():
+                            # outputs = model(**inputs)
+                    # else:
+                    if self.args.torchdynamo_ipex:
+                        import torchdynamo
+                        from torchdynamo.optimizations import backends
+                        if self.args.precision == "float32":
+                            with torchdynamo.optimize(backends.ipex_fp32), torch.no_grad():
+                                outputs = model(**inputs)
+                        if self.args.precision == "bfloat16":
+                            with torchdynamo.optimize(backends.ipex_bf16), torch.no_grad(), torch.cpu.amp.autocast():
+                                outputs = model(**inputs)
                     else:
                         outputs = model(**inputs)
                     if isinstance(outputs, dict):
@@ -2622,27 +3046,65 @@ class Trainer:
             self._past = None
 
         self.callback_handler.eval_dataloader = dataloader
+        if self.args.precision == 'bfloat16':
+            with torch.cpu.amp.autocast(enabled=True, dtype=torch.bfloat16):
+                itcount = 0
+                num_loop = 1
+                if ((self.num_examples(dataloader)//batch_size)+1) < self.args.minimum_iter:
+                    num_loop = self.args.minimum_iter//((self.num_examples(dataloader)//batch_size)+1)
+                for repeat in range(num_loop):
+                    for step, inputs in enumerate(dataloader):
+                        itcount = itcount + 1
+                        if itcount == self.args.early_stop_at_iter:
+                            break
+                        loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+                        if loss is not None:
+                            losses = loss.repeat(batch_size)
+                            losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
+                        if logits is not None:
+                            preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
+                        if labels is not None:
+                            labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
+                        self.control = self.callback_handler.on_prediction_step(self.args, self.state, self.control)
 
-        for step, inputs in enumerate(dataloader):
-            loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
-            if loss is not None:
-                losses = loss.repeat(batch_size)
-                losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
-            if logits is not None:
-                preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
-            if labels is not None:
-                labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
-            self.control = self.callback_handler.on_prediction_step(self.args, self.state, self.control)
+                        # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
+                        if self.args.eval_accumulation_steps is not None and (step + 1) % self.args.eval_accumulation_steps == 0:
+                            eval_losses_gatherer.add_arrays(self._gather_and_numpify(losses_host, "eval_losses"))
+                            if not prediction_loss_only:
+                                preds_gatherer.add_arrays(self._gather_and_numpify(preds_host, "eval_preds"))
+                                labels_gatherer.add_arrays(self._gather_and_numpify(labels_host, "eval_label_ids"))
 
-            # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
-            if self.args.eval_accumulation_steps is not None and (step + 1) % self.args.eval_accumulation_steps == 0:
-                eval_losses_gatherer.add_arrays(self._gather_and_numpify(losses_host, "eval_losses"))
-                if not prediction_loss_only:
-                    preds_gatherer.add_arrays(self._gather_and_numpify(preds_host, "eval_preds"))
-                    labels_gatherer.add_arrays(self._gather_and_numpify(labels_host, "eval_label_ids"))
+                            # Set back to None to begin a new accumulation
+                            losses_host, preds_host, labels_host = None, None, None
+        else:
+            itcount = 0
+            num_loop = 1
+            if ((self.num_examples(dataloader)//batch_size)+1) < self.args.minimum_iter:
+                num_loop = self.args.minimum_iter//((self.num_examples(dataloader)//batch_size)+1)
+            for repeat in range(num_loop):
+                for step, inputs in enumerate(dataloader):
+                    itcount = itcount + 1
+                    if itcount == self.args.early_stop_at_iter or step == (self.num_examples(dataloader)//batch_size):
+                        break
+                    loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+                    if loss is not None:
+                        losses = loss.repeat(batch_size)
+                        losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
+                    if logits is not None:
+                        preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
+                    if labels is not None:
+                        labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
+                    self.control = self.callback_handler.on_prediction_step(self.args, self.state, self.control)
 
-                # Set back to None to begin a new accumulation
-                losses_host, preds_host, labels_host = None, None, None
+                    # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
+                    if self.args.eval_accumulation_steps is not None and (step + 1) % self.args.eval_accumulation_steps == 0:
+                        eval_losses_gatherer.add_arrays(self._gather_and_numpify(losses_host, "eval_losses"))
+                        if not prediction_loss_only:
+                            preds_gatherer.add_arrays(self._gather_and_numpify(preds_host, "eval_preds"))
+                            labels_gatherer.add_arrays(self._gather_and_numpify(labels_host, "eval_label_ids"))
+
+                        # Set back to None to begin a new accumulation
+                        losses_host, preds_host, labels_host = None, None, None
 
         if self.args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of the evaluation loop
@@ -2690,4 +3152,4 @@ class Trainer:
         elif self.args.local_rank != -1:
             tensors = distributed_concat(tensors)
 
-        return nested_numpify(tensors)
+        return nested_numpify(tensors, self.args.precision)

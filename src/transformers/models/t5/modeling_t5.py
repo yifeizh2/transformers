@@ -323,7 +323,10 @@ class T5Attention(nn.Module):
         self.o = nn.Linear(self.inner_dim, self.d_model, bias=False)
 
         if self.has_relative_attention_bias:
-            self.relative_attention_bias = nn.Embedding(self.relative_attention_num_buckets, self.n_heads)
+            if config.precision == "bfloat16":
+                self.relative_attention_bias = nn.Embedding(self.relative_attention_num_buckets, self.n_heads, dtype=torch.bfloat16)
+            else:
+                self.relative_attention_bias = nn.Embedding(self.relative_attention_num_buckets, self.n_heads)
         self.pruned_heads = set()
         self.gradient_checkpointing = getattr(config, "gradient_checkpointing", False)
 
@@ -1248,7 +1251,10 @@ class T5Model(T5PreTrainedModel):
 
     def __init__(self, config: T5Config):
         super().__init__(config)
-        self.shared = nn.Embedding(config.vocab_size, config.d_model)
+        if config.precision == "bfloat16":
+            self.shared = nn.Embedding(config.vocab_size, config.d_model, dtype=torch.bfloat16)
+        else:
+            self.shared = nn.Embedding(config.vocab_size, config.d_model)
 
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
@@ -1435,7 +1441,10 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         super().__init__(config)
         self.model_dim = config.d_model
 
-        self.shared = nn.Embedding(config.vocab_size, config.d_model)
+        if config.precision == "bfloat16":
+            self.shared = nn.Embedding(config.vocab_size, config.d_model, dtype=torch.bfloat16)
+        else:
+            self.shared = nn.Embedding(config.vocab_size, config.d_model)
 
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
@@ -1507,6 +1516,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         self,
         input_ids=None,
         attention_mask=None,
+        labels=None,
         decoder_input_ids=None,
         decoder_attention_mask=None,
         head_mask=None,
@@ -1516,7 +1526,6 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         past_key_values=None,
         inputs_embeds=None,
         decoder_inputs_embeds=None,
-        labels=None,
         use_cache=None,
         output_attentions=None,
         output_hidden_states=None,
@@ -1723,7 +1732,10 @@ class T5EncoderModel(T5PreTrainedModel):
 
     def __init__(self, config: T5Config):
         super().__init__(config)
-        self.shared = nn.Embedding(config.vocab_size, config.d_model)
+        if config.precision == "bfloat16":
+            self.shared = nn.Embedding(config.vocab_size, config.d_model, dtype=torch.bfloat16)
+        else:
+            self.shared = nn.Embedding(config.vocab_size, config.d_model)
 
         encoder_config = copy.deepcopy(config)
         encoder_config.use_cache = False

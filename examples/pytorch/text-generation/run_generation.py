@@ -24,6 +24,9 @@ import logging
 import numpy as np
 import torch
 
+import time
+import os
+
 from transformers import (
     CTRLLMHeadModel,
     CTRLTokenizer,
@@ -37,6 +40,7 @@ from transformers import (
     XLMWithLMHeadModel,
     XLNetLMHeadModel,
     XLNetTokenizer,
+    GPT2Config,
 )
 
 
@@ -150,6 +154,20 @@ def adjust_length_to_model(length, max_sequence_length):
         length = MAX_LENGTH  # avoid infinite loop
     return length
 
+def trace_handler(p):
+    output = p.key_averages().table(sort_by="self_cpu_time_total")
+    print(output)
+    import pathlib
+    timeline_dir = str(pathlib.Path.cwd()) + '/timeline/'
+    if not os.path.exists(timeline_dir):
+        try:
+            os.makedirs(timeline_dir)
+        except:
+            pass
+    timeline_file = timeline_dir + 'timeline-' + str(torch.backends.quantized.engine) + '-' + \
+                str(p.step_num) + '-' + str(os.getpid()) + '.json'
+    p.export_chrome_trace(timeline_file)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -168,7 +186,7 @@ def main():
         help="Path to pre-trained model or shortcut name selected in the list: " + ", ".join(MODEL_CLASSES.keys()),
     )
 
-    parser.add_argument("--prompt", type=str, default="")
+    parser.add_argument("--prompt", type=str, default="hello world")
     parser.add_argument("--length", type=int, default=20)
     parser.add_argument("--stop_token", type=str, default=None, help="Token at which text generation is stopped")
 
@@ -196,6 +214,18 @@ def main():
         action="store_true",
         help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit",
     )
+    parser.add_argument("--num_warmup_iter", "--warmup_iter", type=int, default=50, help="The number warmup, default is 50.")
+    parser.add_argument("--benchmark_iter", "--early_stop_at_iter",type=int, default=500, help="The number iters of benchmark, default is 500.")
+    parser.add_argument("--ipex", action="store_true", help="Use Intel IPEX to optimize.")
+    parser.add_argument("--jit", action="store_true", help="Use jit optimize to do optimization.")
+    parser.add_argument("--channels_last", type=bool, default=False, help="Use pytorch NHWC.")
+    parser.add_argument("--profile", type=bool, default=False, help="Trigger profile on current topology.")
+    parser.add_argument('--precision', default='float32', help='Precision, "float32" or "bfloat16"')
+    parser.add_argument('--do_eval', action="store_true", help='do evaluation')
+    parser.add_argument("--overwrite_output_dir", action="store_true", )
+    parser.add_argument("--output_dir", type=str)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default="")
+
     args = parser.parse_args()
 
     args.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
@@ -213,7 +243,9 @@ def main():
         raise KeyError("the model {} you specified is not supported. You are welcome to add it and open a PR :)")
 
     tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path)
-    model = model_class.from_pretrained(args.model_name_or_path)
+    config = GPT2Config.from_pretrained(args.model_name_or_path)
+    config.precision = args.precision
+    model = model_class.from_pretrained(args.model_name_or_path, config=config)
     model.to(args.device)
 
     if args.fp16:
@@ -241,23 +273,155 @@ def main():
     else:
         prefix = args.prefix if args.prefix else args.padding_text
         encoded_prompt = tokenizer.encode(prefix + prompt_text, add_special_tokens=False, return_tensors="pt")
-    encoded_prompt = encoded_prompt.to(args.device)
 
     if encoded_prompt.size()[-1] == 0:
         input_ids = None
     else:
         input_ids = encoded_prompt
 
-    output_sequences = model.generate(
-        input_ids=input_ids,
-        max_length=args.length + len(encoded_prompt[0]),
-        temperature=args.temperature,
-        top_k=args.k,
-        top_p=args.p,
-        repetition_penalty=args.repetition_penalty,
-        do_sample=True,
-        num_return_sequences=args.num_return_sequences,
-    )
+    # encoded_prompt = encoded_prompt.to(args.device)
+    ### to oob
+    if args.channels_last:
+        model_oob, input_oob = model, encoded_prompt
+        try:
+            model_oob = model_oob.to(memory_format=torch.channels_last)
+            input_oob = input_oob.to(memory_format=torch.channels_last)
+            print("---- Use channels_last.")
+        except:
+            pass
+        model, encoded_prompt = model_oob, input_oob
+ 
+    if args.ipex:
+        model.eval()
+        # Import Extension
+        print("---- Use Intel IPEX to optimize model.")
+        import intel_extension_for_pytorch as ipex
+        #ipex._set_blas_backend(backend="mkl")
+        if args.precision == "bfloat16":
+            model = ipex.optimize(model, dtype=torch.bfloat16, inplace=True, auto_kernel_selection=True)
+        else:
+            model = ipex.optimize(model, dtype=torch.float32, inplace=True, auto_kernel_selection=True)
+    if args.jit:
+        try:
+            model = torch.jit.trace(model, encoded_prompt)
+            print("---- With JIT enabled.")
+            if args.ipex:
+                model = torch.jit.freeze(model)
+        except:
+            print("---- With JIT disabled.")
+
+    # inference benchmark
+    total_time = 0.0
+    total_sample = 0
+    batch_time_list = []
+    with torch.no_grad():
+        if args.profile:
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU],
+                record_shapes=True,
+                schedule=torch.profiler.schedule(
+                    wait=int(args.benchmark_iter/2),
+                    warmup=2,
+                    active=1,
+                ),
+                on_trace_ready=trace_handler,
+            ) as p:
+                if args.precision == "bfloat16":
+                    with torch.cpu.amp.autocast(enabled=True, dtype=torch.bfloat16):
+                        for i in range(args.benchmark_iter):
+                            tic  = time.time()
+                            output_sequences = model.generate(
+                                input_ids=encoded_prompt,
+                                max_length=args.length + len(encoded_prompt[0]),
+                                temperature=args.temperature,
+                                top_k=args.k,
+                                top_p=args.p,
+                                repetition_penalty=args.repetition_penalty,
+                                do_sample=True,
+                                num_return_sequences=args.num_return_sequences,
+                            )
+                            p.step()
+                            toc = time.time()
+                            print("Iteration: {}, inference time: {} sec.".format(i, toc - tic), flush=True)
+                            if i >= args.num_warmup_iter:
+                                total_time += (toc - tic)
+                                total_sample += args.num_return_sequences
+                                batch_time_list.append((toc - tic) * 1000)
+                else:
+                    for i in range(args.benchmark_iter):
+                        tic  = time.time()
+                        output_sequences = model.generate(
+                            input_ids=encoded_prompt,
+                            max_length=args.length + len(encoded_prompt[0]),
+                            temperature=args.temperature,
+                            top_k=args.k,
+                            top_p=args.p,
+                            repetition_penalty=args.repetition_penalty,
+                            do_sample=True,
+                            num_return_sequences=args.num_return_sequences,
+                        )
+                        p.step()
+                        toc = time.time()
+                        print("Iteration: {}, inference time: {} sec.".format(i, toc - tic), flush=True)
+                        if i >= args.num_warmup_iter:
+                            total_time += (toc - tic)
+                            total_sample += args.num_return_sequences
+                            batch_time_list.append((toc - tic) * 1000)
+        else:
+            if args.precision == "bfloat16":
+                with torch.cpu.amp.autocast(enabled=True, dtype=torch.bfloat16):
+                    for i in range(args.benchmark_iter):
+                        tic  = time.time()
+                        output_sequences = model.generate(
+                            input_ids=encoded_prompt,
+                            max_length=args.length + len(encoded_prompt[0]),
+                            temperature=args.temperature,
+                            top_k=args.k,
+                            top_p=args.p,
+                            repetition_penalty=args.repetition_penalty,
+                            do_sample=True,
+                            num_return_sequences=args.num_return_sequences,
+                        )
+                        toc = time.time()
+                        print("Iteration: {}, inference time: {} sec.".format(i, toc - tic), flush=True)
+                        if i >= args.num_warmup_iter:
+                            total_time += (toc - tic)
+                            total_sample += args.num_return_sequences
+                            batch_time_list.append((toc - tic) * 1000)
+            else:
+                for i in range(args.benchmark_iter):
+                    tic  = time.time()
+                    output_sequences = model.generate(
+                        input_ids=encoded_prompt,
+                        max_length=args.length + len(encoded_prompt[0]),
+                        temperature=args.temperature,
+                        top_k=args.k,
+                        top_p=args.p,
+                        repetition_penalty=args.repetition_penalty,
+                        do_sample=True,
+                        num_return_sequences=args.num_return_sequences,
+                    )
+                    toc = time.time()
+                    print("Iteration: {}, inference time: {} sec.".format(i, toc - tic), flush=True)
+                    if i >= args.num_warmup_iter:
+                        total_time += (toc - tic)
+                        total_sample += args.num_return_sequences
+                        batch_time_list.append((toc - tic) * 1000)
+
+
+    print("\n", "-"*20, "Summary", "-"*20)
+    print("batch size: ", args.num_return_sequences)
+    latency = total_time / total_sample * 1000
+    throughput = total_sample / total_time
+    print("Latency:\t {:.3f} ms".format(latency))
+    print("Throughput:\t {:.2f} samples/s".format(throughput))
+    # P50
+    batch_time_list.sort()
+    p50_latency = batch_time_list[int(len(batch_time_list) * 0.50) - 1]
+    p90_latency = batch_time_list[int(len(batch_time_list) * 0.90) - 1]
+    p99_latency = batch_time_list[int(len(batch_time_list) * 0.99) - 1]
+    print('Latency P50:\t %.3f ms\nLatency P90:\t %.3f ms\nLatency P99:\t %.3f ms\n'\
+            % (p50_latency, p90_latency, p99_latency))
 
     # Remove the batch dimension when returning multiple sequences
     if len(output_sequences.shape) > 2:
@@ -266,7 +430,7 @@ def main():
     generated_sequences = []
 
     for generated_sequence_idx, generated_sequence in enumerate(output_sequences):
-        print(f"=== GENERATED SEQUENCE {generated_sequence_idx + 1} ===")
+        #print(f"=== GENERATED SEQUENCE {generated_sequence_idx + 1} ===")
         generated_sequence = generated_sequence.tolist()
 
         # Decode text
@@ -281,7 +445,7 @@ def main():
         )
 
         generated_sequences.append(total_sequence)
-        print(total_sequence)
+        #print(total_sequence)
 
     return generated_sequences
 

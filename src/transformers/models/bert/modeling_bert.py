@@ -169,9 +169,14 @@ class BertEmbeddings(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
+        if config.precision == "bfloat16":
+            self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id, dtype=torch.bfloat16)
+            self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size, dtype=torch.bfloat16)
+            self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size, dtype=torch.bfloat16)
+        else:
+            self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
+            self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+            self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
@@ -245,7 +250,10 @@ class BertSelfAttention(nn.Module):
         self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
             self.max_position_embeddings = config.max_position_embeddings
-            self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
+            if config.precision == "bfloat16":
+                self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size, dtype=torch.bfloat16)
+            else:
+                self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
 
         self.is_decoder = config.is_decoder
 
@@ -949,7 +957,8 @@ class BertModel(BertPreTrainedModel):
 
         if attention_mask is None:
             attention_mask = torch.ones(((batch_size, seq_length + past_key_values_length)), device=device)
-
+        if self.config.precision == "bfloat16":
+            attention_mask = attention_mask.to(torch.bfloat16)
         if token_type_ids is None:
             if hasattr(self.embeddings, "token_type_ids"):
                 buffered_token_type_ids = self.embeddings.token_type_ids[:, :seq_length]
@@ -1151,13 +1160,13 @@ class BertLMHeadModel(BertPreTrainedModel):
         self,
         input_ids=None,
         attention_mask=None,
+        labels=None,
         token_type_ids=None,
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
         encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        labels=None,
+        encoder_attention_mask=None,     
         past_key_values=None,
         use_cache=None,
         output_attentions=None,
@@ -1304,14 +1313,14 @@ class BertForMaskedLM(BertPreTrainedModel):
     def forward(
         self,
         input_ids=None,
-        attention_mask=None,
         token_type_ids=None,
+        attention_mask=None,
+        labels=None,
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
-        labels=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -1502,13 +1511,13 @@ class BertForSequenceClassification(BertPreTrainedModel):
     )
     def forward(
         self,
-        input_ids=None,
+        labels=None,
         attention_mask=None,
-        token_type_ids=None,
+        input_ids=None,
+        token_type_ids=None,       
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
-        labels=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -1601,13 +1610,14 @@ class BertForMultipleChoice(BertPreTrainedModel):
     )
     def forward(
         self,
-        input_ids=None,
-        attention_mask=None,
+        
+        input_ids=None,      
         token_type_ids=None,
+        attention_mask=None,
+        labels=None,       
         position_ids=None,
         head_mask=None,
-        inputs_embeds=None,
-        labels=None,
+        inputs_embeds=None,       
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -1699,13 +1709,13 @@ class BertForTokenClassification(BertPreTrainedModel):
     )
     def forward(
         self,
-        input_ids=None,
-        attention_mask=None,
+        labels=None,
+        input_ids=None,       
         token_type_ids=None,
+        attention_mask=None,
         position_ids=None,
         head_mask=None,
-        inputs_embeds=None,
-        labels=None,
+        inputs_embeds=None,  
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,

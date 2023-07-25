@@ -75,9 +75,14 @@ class RobertaEmbeddings(nn.Module):
     # Copied from transformers.models.bert.modeling_bert.BertEmbeddings.__init__
     def __init__(self, config):
         super().__init__()
-        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
+        if config.precision == "bfloat16":
+            self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id, dtype=torch.bfloat16)
+            self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size, dtype=torch.bfloat16)
+            self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size, dtype=torch.bfloat16)
+        else:
+            self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
+            self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+            self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
@@ -95,9 +100,14 @@ class RobertaEmbeddings(nn.Module):
 
         # End copy
         self.padding_idx = config.pad_token_id
-        self.position_embeddings = nn.Embedding(
-            config.max_position_embeddings, config.hidden_size, padding_idx=self.padding_idx
-        )
+        if config.precision == "bfloat16":
+            self.position_embeddings = nn.Embedding(
+                config.max_position_embeddings, config.hidden_size, padding_idx=self.padding_idx, dtype=torch.bfloat16
+            )
+        else:
+            self.position_embeddings = nn.Embedding(
+                config.max_position_embeddings, config.hidden_size, padding_idx=self.padding_idx
+            )
 
     def forward(
         self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None, past_key_values_length=0
@@ -179,7 +189,10 @@ class RobertaSelfAttention(nn.Module):
         self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
             self.max_position_embeddings = config.max_position_embeddings
-            self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
+            if config.precision == "bfloat16":
+                self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size, dtype=torch.bfloat16)
+            else:
+                self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
 
         self.is_decoder = config.is_decoder
 
@@ -244,7 +257,7 @@ class RobertaSelfAttention(nn.Module):
             position_ids_r = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).view(1, -1)
             distance = position_ids_l - position_ids_r
             positional_embedding = self.distance_embedding(distance + self.max_position_embeddings - 1)
-            positional_embedding = positional_embedding.to(dtype=query_layer.dtype)  # fp16 compatibility
+            # positional_embedding = positional_embedding.to(dtype=query_layer.dtype)  # fp16 compatibility
 
             if self.position_embedding_type == "relative_key":
                 relative_position_scores = torch.einsum("bhld,lrd->bhlr", query_layer, positional_embedding)
@@ -802,7 +815,8 @@ class RobertaModel(RobertaPreTrainedModel):
 
         if attention_mask is None:
             attention_mask = torch.ones(((batch_size, seq_length + past_key_values_length)), device=device)
-
+        if self.config.precision == "bfloat16":
+            attention_mask = attention_mask.to(torch.bfloat16)
         if token_type_ids is None:
             if hasattr(self.embeddings, "token_type_ids"):
                 buffered_token_type_ids = self.embeddings.token_type_ids[:, :seq_length]
@@ -902,13 +916,13 @@ class RobertaForCausalLM(RobertaPreTrainedModel):
         self,
         input_ids=None,
         attention_mask=None,
+        labels=None,
         token_type_ids=None,
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
-        labels=None,
         past_key_values=None,
         use_cache=None,
         output_attentions=None,
@@ -1059,15 +1073,15 @@ class RobertaForMaskedLM(RobertaPreTrainedModel):
     )
     def forward(
         self,
-        input_ids=None,
+        labels=None,
         attention_mask=None,
+        input_ids=None,
         token_type_ids=None,
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
         encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        labels=None,
+        encoder_attention_mask=None,        
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -1171,13 +1185,13 @@ class RobertaForSequenceClassification(RobertaPreTrainedModel):
     )
     def forward(
         self,
-        input_ids=None,
+        labels=None,
         attention_mask=None,
+        input_ids=None,
         token_type_ids=None,
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
-        labels=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -1268,9 +1282,9 @@ class RobertaForMultipleChoice(RobertaPreTrainedModel):
     def forward(
         self,
         input_ids=None,
-        token_type_ids=None,
         attention_mask=None,
         labels=None,
+        token_type_ids=None,
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
@@ -1366,11 +1380,11 @@ class RobertaForTokenClassification(RobertaPreTrainedModel):
         self,
         input_ids=None,
         attention_mask=None,
+        labels=None,
         token_type_ids=None,
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
-        labels=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,

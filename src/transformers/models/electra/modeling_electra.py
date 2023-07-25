@@ -158,9 +158,14 @@ class ElectraEmbeddings(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.word_embeddings = nn.Embedding(config.vocab_size, config.embedding_size, padding_idx=config.pad_token_id)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.embedding_size)
-        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.embedding_size)
+        if config.precision == "bfloat16":
+            self.word_embeddings = nn.Embedding(config.vocab_size, config.embedding_size, padding_idx=config.pad_token_id, dtype=torch.bfloat16)
+            self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.embedding_size, dtype=torch.bfloat16)
+            self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.embedding_size, dtype=torch.bfloat16)
+        else:
+            self.word_embeddings = nn.Embedding(config.vocab_size, config.embedding_size, padding_idx=config.pad_token_id)
+            self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.embedding_size)
+            self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.embedding_size)
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
@@ -237,7 +242,10 @@ class ElectraSelfAttention(nn.Module):
         self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
             self.max_position_embeddings = config.max_position_embeddings
-            self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
+            if config.precision == "bfloat16":
+                self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size, dtype=torch.bfloat16)
+            else:
+                self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
 
         self.is_decoder = config.is_decoder
 
@@ -864,6 +872,8 @@ class ElectraModel(ElectraPreTrainedModel):
 
         if attention_mask is None:
             attention_mask = torch.ones(input_shape, device=device)
+        if self.config.precision == "bfloat16":
+            attention_mask = attention_mask.to(torch.bfloat16)
         if token_type_ids is None:
             if hasattr(self.embeddings, "token_type_ids"):
                 buffered_token_type_ids = self.embeddings.token_type_ids[:, :seq_length]
@@ -942,13 +952,13 @@ class ElectraForSequenceClassification(ElectraPreTrainedModel):
     )
     def forward(
         self,
+        labels=None,
         input_ids=None,
-        attention_mask=None,
         token_type_ids=None,
+        attention_mask=None,
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
-        labels=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -1137,13 +1147,13 @@ class ElectraForMaskedLM(ElectraPreTrainedModel):
     )
     def forward(
         self,
-        input_ids=None,
-        attention_mask=None,
+        labels=None,
+        input_ids=None,   
         token_type_ids=None,
+        attention_mask=None,
         position_ids=None,
         head_mask=None,
-        inputs_embeds=None,
-        labels=None,
+        inputs_embeds=None,       
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -1220,12 +1230,12 @@ class ElectraForTokenClassification(ElectraPreTrainedModel):
     def forward(
         self,
         input_ids=None,
-        attention_mask=None,
         token_type_ids=None,
+        attention_mask=None,
+        labels=None,
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
-        labels=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -1408,12 +1418,12 @@ class ElectraForMultipleChoice(ElectraPreTrainedModel):
     def forward(
         self,
         input_ids=None,
-        attention_mask=None,
         token_type_ids=None,
+        attention_mask=None,
+        labels=None,
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
-        labels=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,

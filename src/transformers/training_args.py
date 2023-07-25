@@ -625,6 +625,27 @@ class TrainingArguments:
         metadata={"help": "Used by the SageMaker launcher to send mp-specific args. Ignored in Trainer"},
     )
 
+    ipex: bool = field(default=False, metadata={"help": "Use Intel IPEX."})
+    torchdynamo_ipex: bool = field(default=False, metadata={"help": "Use Intel IPEX via torchdynamo."})
+    jit: bool = field(default=False, metadata={"help": "Use jit.trace to do optimization."})
+    use_shared_weight: bool = field(default=False, metadata={"help": "Use weight sharing mode."})
+    jit_optimize: bool = field(default=False, metadata={"help": "Use jit.optimize_for_inference on jit.trace to do optimization."})
+    jit_model_name: str = field(default='bert', metadata={"help": "model for jit trace"})
+    channels_last: bool = field(default=False, metadata={"help": "Use Pytorch NHWC."})
+    profile: bool = field(default=False, metadata={"help": "Trigger profile on current topology."})
+    dnnlverbose: bool = field(default=False, metadata={"help": "Trigger dnnlverbose on current topology."})
+    dnnlverbose_numiter: int = field(default=1, metadata={"help": "Number of iteration to trigger dnnlverbose on current topology."})
+    early_stop_at_iter: int = field(default=-1, metadata={"help": "At which iteration to stop the loop if the model or dataset is too large."})
+    minimum_iter: int = field(default=1, metadata={"help": "Minimum number of iterations. If num_example/batch_size is smaller than this num, it will add loops."})
+    num_warmup_iter: int = field(default=0, metadata={"help": "Warmup steps for evaluation benchmarking."})
+    precision: str = field(default='float32', metadata={"help": "float32, bfloat16, int8."})
+    int8_calibration: bool = field(default=False, metadata={"help": "Do calibration for IPEX INT8."})
+    total_cores: int = field(default=56, metadata={"help": "Number of total cores for weight sharing mode."})
+    cores_per_instance: int = field(default=4, metadata={"help": "Number of cores per instance for weight sharing mode."})
+    auto_kernel_selection: bool = field(default=False, metadata={"help": "enable auto_kernel_selection to use oneDNN"})
+    mkl_backend: bool = field(default=False, metadata={"help": "set blas backend to mkl"})
+    dynamic_shape: bool = field(default=False, metadata={"help": " Specific for dynamic_shape. This is for Int8 dynamic shpae support only"})
+
     def __post_init__(self):
         # Handle --use_env option in torch.distributed.launch (local_rank not passed as an arg then).
         # This needs to happen before any call to self.device or self.n_gpu.
@@ -638,7 +659,7 @@ class TrainingArguments:
 
         # expand paths, if not os.makedirs("~/bar") will make directory
         # in the current directory instead of the actual home
-        #  see https://github.com/huggingface/transformers/issues/10628
+        # 聽see https://github.com/huggingface/transformers/issues/10628
         if self.output_dir is not None:
             self.output_dir = os.path.expanduser(self.output_dir)
         if self.logging_dir is None and self.output_dir is not None:
@@ -651,7 +672,7 @@ class TrainingArguments:
 
         if isinstance(self.evaluation_strategy, EvaluationStrategy):
             warnings.warn(
-                "using `EvaluationStrategy` for `evaluation_strategy` is deprecated and will be removed in version 5 of 🤗 Transformers. Use `IntervalStrategy` instead",
+                "using `EvaluationStrategy` for `evaluation_strategy` is deprecated and will be removed in version 5 of 馃 Transformers. Use `IntervalStrategy` instead",
                 FutureWarning,
             )
             # Go back to the underlying string or we won't be able to instantiate `IntervalStrategy` on it.
@@ -743,7 +764,7 @@ class TrainingArguments:
 
         if self.tpu_metrics_debug:
             warnings.warn(
-                "using `--tpu_metrics_debug` is deprecated and will be removed in version 5 of 🤗 Transformers. Use `--debug tpu_metrics_debug` instead",
+                "using `--tpu_metrics_debug` is deprecated and will be removed in version 5 of 馃 Transformers. Use `--debug tpu_metrics_debug` instead",
                 FutureWarning,
             )
             self.debug += " tpu_metrics_debug"
@@ -1099,7 +1120,7 @@ class TrainingArguments:
 
     def to_sanitized_dict(self) -> Dict[str, Any]:
         """
-        Sanitized serialization to use with TensorBoard’s hparams
+        Sanitized serialization to use with TensorBoard鈥檚 hparams
         """
         d = self.to_dict()
         d = {**d, **{"train_batch_size": self.train_batch_size, "eval_batch_size": self.eval_batch_size}}

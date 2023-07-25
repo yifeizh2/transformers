@@ -324,6 +324,7 @@ def main():
         if model_args.config_overrides is not None:
             logger.info(f"Overriding config: {model_args.config_overrides}")
             config.update_from_string(model_args.config_overrides)
+    config.precision = training_args.precision
 
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,

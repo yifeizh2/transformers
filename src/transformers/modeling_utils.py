@@ -231,11 +231,11 @@ class ModuleUtilsMixin:
 
         if self.dtype == torch.float16:
             encoder_extended_attention_mask = (1.0 - encoder_extended_attention_mask) * -1e4
-        elif self.dtype == torch.float32:
+        elif self.dtype == torch.float32 or self.dtype == torch.bfloat16:
             encoder_extended_attention_mask = (1.0 - encoder_extended_attention_mask) * -1e9
         else:
             raise ValueError(
-                f"{self.dtype} not recognized. `dtype` should be set to either `torch.float32` or `torch.float16`"
+                f"{self.dtype} not recognized. `dtype` should be set to either `torch.float32` or `torch.float16` or `torch.bfloat16`"
             )
 
         return encoder_extended_attention_mask
@@ -775,9 +775,14 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
             )
 
         # Build new embeddings
-        new_embeddings = nn.Embedding(new_num_tokens, old_embedding_dim).to(
-            self.device, dtype=old_embeddings.weight.dtype
-        )
+        if self.config.precision == "bfloat16":
+            new_embeddings = nn.Embedding(new_num_tokens, old_embedding_dim).to(
+                self.device, dtype=torch.bfloat16
+            )
+        else:
+            new_embeddings = nn.Embedding(new_num_tokens, old_embedding_dim).to(
+                self.device, dtype=old_embeddings.weight.dtype
+            )
 
         # initialize all new embeddings (in particular added tokens)
         self._init_weights(new_embeddings)

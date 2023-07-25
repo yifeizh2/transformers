@@ -1823,14 +1823,14 @@ class LongformerForSequenceClassification(LongformerPreTrainedModel):
     )
     def forward(
         self,
+        labels=None,
         input_ids=None,
         attention_mask=None,
         global_attention_mask=None,
         head_mask=None,
         token_type_ids=None,
         position_ids=None,
-        inputs_embeds=None,
-        labels=None,
+        inputs_embeds=None,    
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,

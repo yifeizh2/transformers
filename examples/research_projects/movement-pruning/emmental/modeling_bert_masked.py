@@ -478,7 +478,7 @@ class MaskedBertModel(MaskedBertPreTrainedModel):
         self.config = config
 
         self.embeddings = BertEmbeddings(config)
-        self.embeddings.requires_grad_(requires_grad=False)
+        self.embeddings.requires_grad_(requires_grad=True)
         self.encoder = BertEncoder(config)
         self.pooler = BertPooler(config)
 

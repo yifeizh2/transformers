@@ -576,9 +576,12 @@ class GPT2Model(GPT2PreTrainedModel):
         super().__init__(config)
 
         self.embed_dim = config.hidden_size
-
-        self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
-        self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
+        if config.precision == "bfloat16":
+            self.wte = nn.Embedding(config.vocab_size, self.embed_dim, dtype=torch.bfloat16)
+            self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim, dtype=torch.bfloat16)
+        else:
+            self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
+            self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
 
         self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList([GPT2Block(config) for _ in range(config.num_hidden_layers)])
@@ -924,15 +927,15 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
     def forward(
         self,
         input_ids=None,
-        past_key_values=None,
-        attention_mask=None,
+        attention_mask=None,       
+        labels=None,             
         token_type_ids=None,
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
         encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        labels=None,
+        encoder_attention_mask=None,  
+        past_key_values=None,    
         use_cache=None,
         output_attentions=None,
         output_hidden_states=None,
@@ -1251,15 +1254,15 @@ class GPT2ForSequenceClassification(GPT2PreTrainedModel):
         config_class=_CONFIG_FOR_DOC,
     )
     def forward(
-        self,
+        self,       
         input_ids=None,
-        past_key_values=None,
+        labels=None,       
         attention_mask=None,
+        past_key_values=None,
         token_type_ids=None,
         position_ids=None,
         head_mask=None,
-        inputs_embeds=None,
-        labels=None,
+        inputs_embeds=None,       
         use_cache=None,
         output_attentions=None,
         output_hidden_states=None,
@@ -1372,13 +1375,13 @@ class GPT2ForTokenClassification(GPT2PreTrainedModel):
     def forward(
         self,
         input_ids=None,
-        past_key_values=None,
+        labels=None,
         attention_mask=None,
+        past_key_values=None,
         token_type_ids=None,
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
-        labels=None,
         use_cache=None,
         output_attentions=None,
         output_hidden_states=None,
